@@ -1,6 +1,5 @@
 import streamlit as st
-import psycopg2
-import psycopg2.extras
+from sqlalchemy import create_engine, text
 from datetime import datetime
 
 # ── 页面配置 ──────────────────────────────────────────
@@ -15,40 +14,39 @@ CATEGORIES_ALL  = ["全部"] + CATEGORIES_LIST
 START_DATE = datetime(2026, 5, 31).date()
 
 
-# ── 数据库连接 ────────────────────────────────────────
+# ── 数据库引擎 ────────────────────────────────────────
 @st.cache_resource
-def get_conn():
-    """创建持久连接（Streamlit 生命周期内复用）"""
+def get_engine():
     db_url = st.secrets["DATABASE_URL"]
-    # 将 sslmode 拼入 URL，避免与 DSN 字符串混用关键字参数冲突
-    if "sslmode" not in db_url:
-        sep = "&" if "?" in db_url else "?"
-        db_url = f"{db_url}{sep}sslmode=require"
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = False
-    return conn
+    # SQLAlchemy 要求 postgresql+psycopg2:// 协议头
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return create_engine(
+        db_url,
+        connect_args={"sslmode": "require"},
+        pool_pre_ping=True,   # 自动检测断线并重连
+        pool_recycle=300,
+    )
 
 
-def run(sql, params=(), fetch=None):
-    """统一执行 SQL，自动处理事务与断线重连"""
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params)
-            conn.commit()
-            if fetch == "one":
-                return cur.fetchone()
-            if fetch == "all":
-                return cur.fetchall()
-            return cur.rowcount
-    except Exception:
-        conn.rollback()
-        get_conn.clear()   # 断线后清除缓存，下次自动重连
-        raise
+def run(sql, params=None, fetch=None):
+    """\u7edf一执行 SQL"""
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text(sql), params or {})
+        conn.commit()
+        if fetch == "one":
+            row = result.mappings().fetchone()
+            return dict(row) if row else None
+        if fetch == "all":
+            return [dict(r) for r in result.mappings().fetchall()]
+        return result.rowcount
 
 
 def init_db():
-    """建表（首次运行时执行）"""
+    """\u5efa\u8868\uff08\u9996\u6b21\u8fd0\u884c\u65f6\u6267\u884c\uff09"""
     run("""
         CREATE TABLE IF NOT EXISTS posts (
             id          SERIAL PRIMARY KEY,
@@ -68,8 +66,9 @@ def insert_post(title, category, tags, summary, body) -> int:
     now = datetime.now()
     row = run(
         "INSERT INTO posts (title, category, tags, summary, body, created_at, updated_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (title, category, tags, summary, body, now, now),
+        "VALUES (:title, :category, :tags, :summary, :body, :created_at, :updated_at) RETURNING id",
+        dict(title=title, category=category, tags=tags, summary=summary,
+             body=body, created_at=now, updated_at=now),
         fetch="one",
     )
     return row["id"]
@@ -77,26 +76,29 @@ def insert_post(title, category, tags, summary, body) -> int:
 
 def update_post(post_id, title, category, tags, summary, body):
     run(
-        "UPDATE posts SET title=%s, category=%s, tags=%s, summary=%s, body=%s, updated_at=%s WHERE id=%s",
-        (title, category, tags, summary, body, datetime.now(), post_id),
+        "UPDATE posts SET title=:title, category=:category, tags=:tags, "
+        "summary=:summary, body=:body, updated_at=:updated_at WHERE id=:id",
+        dict(title=title, category=category, tags=tags, summary=summary,
+             body=body, updated_at=datetime.now(), id=post_id),
     )
 
 
 def get_all_posts(category=None, keyword=None) -> list:
     sql = "SELECT * FROM posts WHERE 1=1"
-    params = []
+    params = {}
     if category and category != "全部":
-        sql += " AND category = %s"
-        params.append(category)
+        sql += " AND category = :category"
+        params["category"] = category
     if keyword:
-        sql += " AND (title ILIKE %s OR body ILIKE %s)"
-        params += [f"%{keyword}%", f"%{keyword}%"]
+        sql += " AND (title ILIKE :kw1 OR body ILIKE :kw2)"
+        params["kw1"] = f"%{keyword}%"
+        params["kw2"] = f"%{keyword}%"
     sql += " ORDER BY created_at DESC"
     return run(sql, params, fetch="all") or []
 
 
 def get_post(post_id) -> dict | None:
-    return run("SELECT * FROM posts WHERE id=%s", (post_id,), fetch="one")
+    return run("SELECT * FROM posts WHERE id=:id", {"id": post_id}, fetch="one")
 
 
 def count_posts() -> int:
@@ -148,7 +150,6 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════
 if st.session_state.page == "read":
 
-    # ── 文章详情 ──
     if st.session_state.view_post_id:
         post = get_post(st.session_state.view_post_id)
         if not post:
@@ -174,7 +175,6 @@ if st.session_state.page == "read":
         st.divider()
         st.markdown(post["body"])
 
-    # ── 文章列表 ──
     else:
         col_f1, col_f2 = st.columns([2, 3])
         with col_f1:
