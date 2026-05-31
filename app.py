@@ -1,5 +1,6 @@
 import streamlit as st
-from sqlalchemy import create_engine, text
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime
 
 # ── 页面配置 ──────────────────────────────────────────
@@ -14,39 +15,30 @@ CATEGORIES_ALL  = ["全部"] + CATEGORIES_LIST
 START_DATE = datetime(2026, 5, 31).date()
 
 
-# ── 数据库引擎 ────────────────────────────────────────
-@st.cache_resource
-def get_engine():
+# ── 数据库连接 ────────────────────────────────────────
+def get_conn():
+    """每次调用创建新连接（psycopg3 连接轻量，无需连接池缓存）"""
     db_url = st.secrets["DATABASE_URL"]
-    # SQLAlchemy 要求 postgresql+psycopg2:// 协议头
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
-    elif db_url.startswith("postgresql://"):
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return create_engine(
-        db_url,
-        connect_args={"sslmode": "require"},
-        pool_pre_ping=True,   # 自动检测断线并重连
-        pool_recycle=300,
-    )
+    # 确保协议头正确
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return psycopg.connect(db_url, row_factory=dict_row, sslmode="require")
 
 
 def run(sql, params=None, fetch=None):
-    """\u7edf一执行 SQL"""
-    engine = get_engine()
-    with engine.connect() as conn:
-        result = conn.execute(text(sql), params or {})
-        conn.commit()
-        if fetch == "one":
-            row = result.mappings().fetchone()
-            return dict(row) if row else None
-        if fetch == "all":
-            return [dict(r) for r in result.mappings().fetchall()]
-        return result.rowcount
+    """统一执行 SQL"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            conn.commit()
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return cur.rowcount
 
 
 def init_db():
-    """\u5efa\u8868\uff08\u9996\u6b21\u8fd0\u884c\u65f6\u6267\u884c\uff09"""
+    """建表（首次运行时执行）"""
     run("""
         CREATE TABLE IF NOT EXISTS posts (
             id          SERIAL PRIMARY KEY,
@@ -66,9 +58,8 @@ def insert_post(title, category, tags, summary, body) -> int:
     now = datetime.now()
     row = run(
         "INSERT INTO posts (title, category, tags, summary, body, created_at, updated_at) "
-        "VALUES (:title, :category, :tags, :summary, :body, :created_at, :updated_at) RETURNING id",
-        dict(title=title, category=category, tags=tags, summary=summary,
-             body=body, created_at=now, updated_at=now),
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (title, category, tags, summary, body, now, now),
         fetch="one",
     )
     return row["id"]
@@ -76,29 +67,27 @@ def insert_post(title, category, tags, summary, body) -> int:
 
 def update_post(post_id, title, category, tags, summary, body):
     run(
-        "UPDATE posts SET title=:title, category=:category, tags=:tags, "
-        "summary=:summary, body=:body, updated_at=:updated_at WHERE id=:id",
-        dict(title=title, category=category, tags=tags, summary=summary,
-             body=body, updated_at=datetime.now(), id=post_id),
+        "UPDATE posts SET title=%s, category=%s, tags=%s, "
+        "summary=%s, body=%s, updated_at=%s WHERE id=%s",
+        (title, category, tags, summary, body, datetime.now(), post_id),
     )
 
 
 def get_all_posts(category=None, keyword=None) -> list:
     sql = "SELECT * FROM posts WHERE 1=1"
-    params = {}
+    params = []
     if category and category != "全部":
-        sql += " AND category = :category"
-        params["category"] = category
+        sql += " AND category = %s"
+        params.append(category)
     if keyword:
-        sql += " AND (title ILIKE :kw1 OR body ILIKE :kw2)"
-        params["kw1"] = f"%{keyword}%"
-        params["kw2"] = f"%{keyword}%"
+        sql += " AND (title ILIKE %s OR body ILIKE %s)"
+        params += [f"%{keyword}%", f"%{keyword}%"]
     sql += " ORDER BY created_at DESC"
     return run(sql, params, fetch="all") or []
 
 
 def get_post(post_id) -> dict | None:
-    return run("SELECT * FROM posts WHERE id=:id", {"id": post_id}, fetch="one")
+    return run("SELECT * FROM posts WHERE id=%s", (post_id,), fetch="one")
 
 
 def count_posts() -> int:
