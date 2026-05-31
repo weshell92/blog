@@ -1,8 +1,7 @@
 import streamlit as st
-import sqlite3
-import yaml
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
-from contextlib import contextmanager
 
 # ── 页面配置 ──────────────────────────────────────────
 st.set_page_config(
@@ -11,94 +10,104 @@ st.set_page_config(
     layout="wide",
 )
 
-DB_PATH = "blog.db"
 CATEGORIES_LIST = ["读书笔记", "技术感悟", "复盘", "生活随想"]
 CATEGORIES_ALL  = ["全部"] + CATEGORIES_LIST
 START_DATE = datetime(2026, 5, 31).date()
 
 
-# ── 数据库 ────────────────────────────────────────────
-@contextmanager
+# ── 数据库连接 ────────────────────────────────────────
+@st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    """创建持久连接（Streamlit 生命周期内复用）"""
+    db_url = st.secrets["DATABASE_URL"]
+    conn = psycopg2.connect(db_url, sslmode="require")
+    conn.autocommit = False
+    return conn
+
+
+def run(sql, params=(), fetch=None):
+    """统一执行 SQL，自动处理事务与断线重连"""
+    conn = get_conn()
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            conn.commit()
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return cur.rowcount
+    except Exception:
+        conn.rollback()
+        # 断线后清除缓存重连
+        get_conn.clear()
+        raise
 
 
 def init_db():
     """建表（首次运行时执行）"""
-    with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                title       TEXT    NOT NULL,
-                category    TEXT    NOT NULL,
-                tags        TEXT    DEFAULT '',
-                summary     TEXT    DEFAULT '',
-                body        TEXT    NOT NULL,
-                created_at  TEXT    NOT NULL,
-                updated_at  TEXT    NOT NULL
-            )
-        """)
-
-
-def insert_post(title, category, tags, summary, body) -> int:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO posts (title, category, tags, summary, body, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (title, category, tags, summary, body, now, now),
+    run("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id          SERIAL PRIMARY KEY,
+            title       TEXT    NOT NULL,
+            category    TEXT    NOT NULL,
+            tags        TEXT    DEFAULT '',
+            summary     TEXT    DEFAULT '',
+            body        TEXT    NOT NULL,
+            created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
         )
-        return cur.lastrowid
+    """)
+
+
+# ── CRUD ──────────────────────────────────────────────
+def insert_post(title, category, tags, summary, body) -> int:
+    now = datetime.now()
+    row = run(
+        "INSERT INTO posts (title, category, tags, summary, body, created_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (title, category, tags, summary, body, now, now),
+        fetch="one",
+    )
+    return row["id"]
 
 
 def update_post(post_id, title, category, tags, summary, body):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE posts SET title=?, category=?, tags=?, summary=?, body=?, updated_at=? WHERE id=?",
-            (title, category, tags, summary, body, now, post_id),
-        )
+    run(
+        "UPDATE posts SET title=%s, category=%s, tags=%s, summary=%s, body=%s, updated_at=%s WHERE id=%s",
+        (title, category, tags, summary, body, datetime.now(), post_id),
+    )
 
 
 def get_all_posts(category=None, keyword=None) -> list:
     sql = "SELECT * FROM posts WHERE 1=1"
     params = []
     if category and category != "全部":
-        sql += " AND category = ?"
+        sql += " AND category = %s"
         params.append(category)
     if keyword:
-        sql += " AND (title LIKE ? OR body LIKE ?)"
+        sql += " AND (title ILIKE %s OR body ILIKE %s)"
         params += [f"%{keyword}%", f"%{keyword}%"]
     sql += " ORDER BY created_at DESC"
-    with get_conn() as conn:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    return run(sql, params, fetch="all") or []
 
 
 def get_post(post_id) -> dict | None:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
-        return dict(row) if row else None
+    return run("SELECT * FROM posts WHERE id=%s", (post_id,), fetch="one")
 
 
 def count_posts() -> int:
-    with get_conn() as conn:
-        return conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    row = run("SELECT COUNT(*) AS cnt FROM posts", fetch="one")
+    return row["cnt"] if row else 0
 
 
 # ── 初始化 ────────────────────────────────────────────
 init_db()
 
-# session state
 for key, default in [
-    ("page", "read"),        # read | write | edit
-    ("view_post_id", None),  # 正在阅读的文章 id
-    ("edit_post_id", None),  # 正在编辑的文章 id
+    ("page", "read"),
+    ("view_post_id", None),
+    ("edit_post_id", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -153,10 +162,12 @@ if st.session_state.page == "read":
 
         st.title(post["title"])
         c1, c2, c3, c4 = st.columns(4)
-        c1.caption(f"📅 {post['created_at'][:10]}")
+        c1.caption(f"📅 {str(post['created_at'])[:10]}")
         c2.caption(f"📂 {post['category']}")
         c3.caption(f"🏷 {post['tags']}" if post["tags"] else "")
-        c4.caption(f"🔄 更新于 {post['updated_at'][:10]}" if post["updated_at"][:10] != post["created_at"][:10] else "")
+        updated = str(post['updated_at'])[:10]
+        created = str(post['created_at'])[:10]
+        c4.caption(f"🔄 更新于 {updated}" if updated != created else "")
         st.divider()
         st.markdown(post["body"])
 
@@ -198,7 +209,7 @@ if st.session_state.page == "read":
                         if post.get("tags"):
                             st.markdown(" ".join([f"`{t}`" for t in post["tags"].split(",") if t.strip()]))
                     with col2:
-                        st.caption(post["created_at"][:10])
+                        st.caption(str(post["created_at"])[:10])
                         st.caption(f"📂 {post['category']}")
                         if st.button("阅读 →", key=f"read_{post['id']}"):
                             go("read", view_post_id=post["id"])
@@ -209,19 +220,19 @@ if st.session_state.page == "read":
 # ══════════════════════════════════════════════════════
 elif st.session_state.page == "write":
     st.title("✍️ 写新文章")
-    st.caption("填写完成后点击发布，文章立即保存 ✅")
+    st.caption("填写完成后点击发布，文章立即保存到 Supabase ✅")
     st.divider()
 
     with st.form("write_form", clear_on_submit=True):
-        title    = st.text_input("📌 标题 *", placeholder="今天想写什么？")
+        title = st.text_input("📌 标题 *", placeholder="今天想写什么？")
         col1, col2 = st.columns(2)
         with col1:
             category = st.selectbox("📂 分类 *", CATEGORIES_LIST)
         with col2:
             tags_input = st.text_input("🏷 标签", placeholder="用逗号分隔，如：Python, 读书")
-        summary  = st.text_input("💬 摘要", placeholder="一句话简介（显示在列表页）")
-        body     = st.text_area("📝 正文（支持 Markdown）", height=450,
-                                placeholder="## 开始写作...\n\n支持 **加粗**、*斜体*、`代码`、列表等语法。")
+        summary = st.text_input("💬 摘要", placeholder="一句话简介（显示在列表页）")
+        body = st.text_area("📝 正文（支持 Markdown）", height=450,
+                            placeholder="## 开始写作...\n\n支持 **加粗**、*斜体*、`代码`、列表等语法。")
         submitted = st.form_submit_button("🚀 发布文章", type="primary", use_container_width=True)
 
     if submitted:
@@ -261,20 +272,21 @@ elif st.session_state.page == "edit":
         go("read", view_post_id=post["id"])
 
     st.title("✏️ 编辑文章")
-    st.caption(f"创建于 {post['created_at'][:10]}")
+    st.caption(f"创建于 {str(post['created_at'])[:10]}")
     st.divider()
 
     with st.form("edit_form"):
-        title    = st.text_input("📌 标题 *", value=post["title"])
+        title = st.text_input("📌 标题 *", value=post["title"])
         col1, col2 = st.columns(2)
         with col1:
-            category = st.selectbox("📂 分类 *", CATEGORIES_LIST,
-                                    index=CATEGORIES_LIST.index(post["category"])
-                                    if post["category"] in CATEGORIES_LIST else 0)
+            category = st.selectbox(
+                "📂 分类 *", CATEGORIES_LIST,
+                index=CATEGORIES_LIST.index(post["category"]) if post["category"] in CATEGORIES_LIST else 0,
+            )
         with col2:
             tags_input = st.text_input("🏷 标签", value=post["tags"])
-        summary  = st.text_input("💬 摘要", value=post["summary"])
-        body     = st.text_area("📝 正文（支持 Markdown）", value=post["body"], height=450)
+        summary = st.text_input("💬 摘要", value=post["summary"])
+        body = st.text_area("📝 正文（支持 Markdown）", value=post["body"], height=450)
         submitted = st.form_submit_button("💾 保存修改", type="primary", use_container_width=True)
 
     if submitted:
