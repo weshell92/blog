@@ -20,7 +20,11 @@ START_DATE = datetime(2026, 5, 31).date()
 def get_conn():
     """创建持久连接（Streamlit 生命周期内复用）"""
     db_url = st.secrets["DATABASE_URL"]
-    conn = psycopg2.connect(db_url, sslmode="require")
+    # 将 sslmode 拼入 URL，避免与 DSN 字符串混用关键字参数冲突
+    if "sslmode" not in db_url:
+        sep = "&" if "?" in db_url else "?"
+        db_url = f"{db_url}{sep}sslmode=require"
+    conn = psycopg2.connect(db_url)
     conn.autocommit = False
     return conn
 
@@ -39,8 +43,7 @@ def run(sql, params=(), fetch=None):
             return cur.rowcount
     except Exception:
         conn.rollback()
-        # 断线后清除缓存重连
-        get_conn.clear()
+        get_conn.clear()   # 断线后清除缓存，下次自动重连
         raise
 
 
@@ -49,11 +52,11 @@ def init_db():
     run("""
         CREATE TABLE IF NOT EXISTS posts (
             id          SERIAL PRIMARY KEY,
-            title       TEXT    NOT NULL,
-            category    TEXT    NOT NULL,
-            tags        TEXT    DEFAULT '',
-            summary     TEXT    DEFAULT '',
-            body        TEXT    NOT NULL,
+            title       TEXT      NOT NULL,
+            category    TEXT      NOT NULL,
+            tags        TEXT      DEFAULT '',
+            summary     TEXT      DEFAULT '',
+            body        TEXT      NOT NULL,
             created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
             updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
         )
