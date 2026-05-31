@@ -20,8 +20,8 @@ START_DATE = datetime(2026, 5, 31).date()
 # ── 数据库连接 ────────────────────────────────────────
 def make_conn_str() -> str:
     """
-    解析 DATABASE_URL，强制将域名解析为 IPv4 地址，
-    避免 Streamlit Cloud 不支持 IPv6 的问题。
+    解析 DATABASE_URL，对密码做 URL 编码，
+    强制将域名解析为 IPv4，保留原始端口。
     """
     raw = st.secrets["DATABASE_URL"]
     parsed = urlparse(raw)
@@ -29,16 +29,16 @@ def make_conn_str() -> str:
     username = quote(parsed.username or "", safe="")
     password = quote(parsed.password or "", safe="")
     host     = parsed.hostname
+    port     = parsed.port or 5432   # 保留 URL 中的端口（连接池 6543 / 直连 5432）
     dbname   = (parsed.path or "/postgres").lstrip("/") or "postgres"
 
-    # 强制解析为 IPv4
+    # 强制解析为 IPv4，避免 Streamlit Cloud 不支持 IPv6
     try:
         ipv4 = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
     except socket.gaierror:
-        ipv4 = host  # 解析失败则用原始 host
+        ipv4 = host
 
-    # 使用直连端口 5432（IPv4 下直连比 PgBouncer 更稳定）
-    return f"postgresql://{username}:{password}@{ipv4}:5432/{dbname}?sslmode=require"
+    return f"postgresql://{username}:{password}@{ipv4}:{port}/{dbname}?sslmode=require"
 
 
 def get_conn():
