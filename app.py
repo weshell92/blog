@@ -2,6 +2,7 @@ import streamlit as st
 import psycopg
 from psycopg.rows import dict_row
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse, quote
 
 # ── 页面配置 ──────────────────────────────────────────
 st.set_page_config(
@@ -16,16 +17,31 @@ START_DATE = datetime(2026, 5, 31).date()
 
 
 # ── 数据库连接 ────────────────────────────────────────
+def make_conn_str() -> str:
+    """
+    解析 DATABASE_URL，对密码中的特殊字符进行 URL 编码，
+    并强制使用 Supabase 连接池端口 6543。
+    """
+    raw = st.secrets["DATABASE_URL"]
+    parsed = urlparse(raw)
+
+    # 对密码进行 URL 编码（处理 * @ : 等特殊字符）
+    username = quote(parsed.username or "", safe="")
+    password = quote(parsed.password or "", safe="")
+
+    # 使用端口 6543（Supabase PgBouncer 连接池）
+    host = parsed.hostname
+    port = 6543
+    dbname = (parsed.path or "/postgres").lstrip("/") or "postgres"
+
+    return f"postgresql://{username}:{password}@{host}:{port}/{dbname}?sslmode=require"
+
+
 def get_conn():
-    """每次调用创建新连接（psycopg3 连接轻量，无需连接池缓存）"""
-    db_url = st.secrets["DATABASE_URL"]
-    # 确保协议头正确
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-    return psycopg.connect(db_url, row_factory=dict_row, sslmode="require")
+    return psycopg.connect(make_conn_str(), row_factory=dict_row)
 
 
 def run(sql, params=None, fetch=None):
-    """统一执行 SQL"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
@@ -38,7 +54,6 @@ def run(sql, params=None, fetch=None):
 
 
 def init_db():
-    """建表（首次运行时执行）"""
     run("""
         CREATE TABLE IF NOT EXISTS posts (
             id          SERIAL PRIMARY KEY,
@@ -96,7 +111,12 @@ def count_posts() -> int:
 
 
 # ── 初始化 ────────────────────────────────────────────
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"数据库连接失败：{type(e).__name__}: {e}")
+    st.info("💡 请检查 Streamlit Secrets 中的 DATABASE_URL 是否正确。")
+    st.stop()
 
 for key, default in [
     ("page", "read"),
@@ -134,9 +154,7 @@ with st.sidebar:
     st.metric("📅 坚持天数", max(days_kept, 1))
 
 
-# ══════════════════════════════════════════════════════
-# 📖 阅读页
-# ══════════════════════════════════════════════════════
+# ══ 📖 阅读页 ══
 if st.session_state.page == "read":
 
     if st.session_state.view_post_id:
@@ -207,9 +225,7 @@ if st.session_state.page == "read":
                             go("read", view_post_id=post["id"])
 
 
-# ══════════════════════════════════════════════════════
-# ✍️ 写文章页
-# ══════════════════════════════════════════════════════
+# ══ ✍️ 写文章页 ══
 elif st.session_state.page == "write":
     st.title("✍️ 写新文章")
     st.caption("填写完成后点击发布，文章立即保存到 Supabase ✅")
@@ -251,9 +267,7 @@ elif st.session_state.page == "write":
         """)
 
 
-# ══════════════════════════════════════════════════════
-# ✏️ 编辑文章页
-# ══════════════════════════════════════════════════════
+# ══ ✏️ 编辑文章页 ══
 elif st.session_state.page == "edit":
     post = get_post(st.session_state.edit_post_id)
     if not post:
